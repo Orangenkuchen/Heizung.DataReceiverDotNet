@@ -4,6 +4,8 @@
     using Microsoft.Extensions.Hosting;
     using Microsoft.Extensions.DependencyInjection;
     using Serilog;
+    using Heizung.DataRecieverDotNet.HostedService.SerialHeaterData;
+    using Microsoft.Extensions.Configuration;
 
     public class Program
     {
@@ -52,9 +54,25 @@
         /// <returns></returns>
         public static IHostBuilder CreateHostBuilder(string[] args)
         {
+            IConfiguration config = new ConfigurationBuilder()
+                .AddJsonFile("appsettings.json", true, true)
+                .Build();
+
             return Host.CreateDefaultBuilder(args)
                 .UseSerilog() // Überschreibt das Logging mit Serilog
                 .UseSystemd()
+                .ConfigureAppConfiguration((configBuilder) =>
+                {
+                    string configFileLocation;
+
+                    #if DEBUG
+                    configFileLocation = "appsettings.development.json";
+                    #else
+                    configFileLocation = "appsettings.json";
+                    #endif
+
+                    configBuilder.AddJsonFile(configFileLocation, false, true);
+                })
                 .ConfigureServices((service) =>
                 {
                     service.AddHostedService<SerialHeaterDataService>();
