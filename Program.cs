@@ -60,7 +60,8 @@
 
             return Host.CreateDefaultBuilder(args)
                 .UseSerilog() // Überschreibt das Logging mit Serilog
-                .UseSystemd()
+                .UseSystemd() // Wenn unter Linux verwendet wird
+                .UseWindowsService() // Wenn unter Windows verwendet wird
                 .ConfigureAppConfiguration((configBuilder) =>
                 {
                     string configFileLocation;

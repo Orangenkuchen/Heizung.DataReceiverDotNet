@@ -1,8 +1,9 @@
 namespace Heizung.DataRecieverDotNet.HostedService.SerialHeaterData
 {
     using System;
+    using System.Buffers;
     using System.Collections.Generic;
-    using System.IO;
+    using System.IO.Pipelines;
     using System.IO.Ports;
     using System.Threading;
     using System.Threading.Tasks;
@@ -29,12 +30,22 @@ namespace Heizung.DataRecieverDotNet.HostedService.SerialHeaterData
         /// <summary>
         /// Stream für die Daten aus dem Seriellen Port
         /// </summary>
-        private BufferedStream serialPortStream;
+        private Pipe serialPortPipe;
 
         /// <summary>
         /// Liste mit Funktion welche beim Dispose aufgerufen weden sollen.
         /// </summary>
         private IList<Action> disposeFunctions;
+
+        /// <summary>
+        /// Gibt an, ob der Service heruntergefahren werden soll
+        /// </summary>
+        private CancellationTokenSource shutdownCancellationTokenSource;
+
+        /// <summary>
+        /// Gibt an, ob der Service unsauber heruntergefahren werden soll
+        /// </summary>
+        private CancellationTokenSource killServiceTokenSource;
         #endregion
 
         #region ctor
@@ -73,6 +84,9 @@ namespace Heizung.DataRecieverDotNet.HostedService.SerialHeaterData
         /// <returns></returns>
         public Task StartAsync(CancellationToken cancellationToken)
         {
+            this.shutdownCancellationTokenSource = new CancellationTokenSource();
+            this.killServiceTokenSource = new CancellationTokenSource();
+
             return Task.Run(() =>
             {
                 this.logger.LogInformation("SerialHeaterDataService starting...");
@@ -99,6 +113,12 @@ namespace Heizung.DataRecieverDotNet.HostedService.SerialHeaterData
         /// <returns></returns>
         public Task StopAsync(CancellationToken cancellationToken)
         {
+            this.shutdownCancellationTokenSource.Cancel();
+            cancellationToken.Register(() => 
+            {
+                this.killServiceTokenSource.Cancel();
+            });
+
             return Task.Run(() => 
             {
                 this.logger.LogInformation("SerialHeaterDataService stopping...");
@@ -123,9 +143,17 @@ namespace Heizung.DataRecieverDotNet.HostedService.SerialHeaterData
         {
             this.logger.LogTrace("Connecting to SerialPort ...");
             this.serialPort.Open();
+
+            this.ProcessLinesAsync(this.serialPort, this.shutdownCancellationTokenSource.Token);
+
             this.logger.LogTrace("SerialPort connected");
             
-            this.serialPort.DataReceived += this.HandleSerialDataReceived;
+            //this.serialPort.DataReceived += this.HandleSerialDataReceived;
+            this.serialPort.DataReceived += (sender, e) => 
+            {
+                var d = "d";
+                //this.logger.Verbose(sender);
+            };
         }
         #endregion
 
@@ -137,32 +165,145 @@ namespace Heizung.DataRecieverDotNet.HostedService.SerialHeaterData
         {
             this.logger.LogTrace("Disconnecting from SerialPort ...");
 
-            this.serialPort.DataReceived -= this.HandleSerialDataReceived;
-
             this.serialPort.Close();
-            this.serialPortStream.Close();
-            this.serialPortStream.Dispose();
 
             this.logger.LogTrace("Discconeted from SerialPort");
         }
         #endregion
 
-        #region HandleSerialDataReceived
+        #region ProcessLinesAsync
         /// <summary>
-        /// Wird aufgerufen, wenn am seriellen Port neue Daten angekommen sind
+        /// Startet das Befüllen und auslesen der Pipe anhand der Daten vom SerialPort. (Läuft bis cancellationToken abgebrochen wird)
         /// </summary>
-        /// <param name="sender">Der serielle Port von dem das Event kommt</param>
-        /// <param name="eventArgs"></param>
-        private void HandleSerialDataReceived(object sender, SerialDataReceivedEventArgs eventArgs)
+        /// <param name="serialPort">Der Serielle Port welcher ausgelesen werden soll</param>
+        /// <param name="cancellationToken">Anhand dieses Tokens wird die Funktion abgebrochen.</param>
+        /// <returns>Wird beenden wenn der Cancellationtoken abgebrochen wird</returns>
+        private async Task ProcessLinesAsync(SerialPort serialPort, CancellationToken cancellationToken)
         {
-            var serialPort = (SerialPort)sender;
+            var pipe = new Pipe();
 
-            if (serialPort.IsOpen)
+            Task writing = this.FillPipeAsync(serialPort, pipe.Writer, cancellationToken);
+            Task reading = this.ReadPipeAsync(pipe.Reader, cancellationToken);
+
+            await Task.WhenAll(reading, writing);
+        }
+        #endregion
+
+        #region FillPipeAsync
+        /// <summary>
+        /// Füllt die den Pipewriter anhand vom SeriellenPort. (Wird erst beenden, wenn cancellationToken abgebrochen wird)
+        /// </summary>
+        /// <param name="serialPort">Der serielle Port von dem die Daten genommen werden sollen</param>
+        /// <param name="writer">Der Writer von der Pipe, welche beschrieben werden soll</param>
+        /// <param name="cancellationToken">Anhand dieses Tokens wird die Funktion abgebrochen.</param>
+        /// <returns>Wird erst beenden, wenn cancellationToken abgebrochen wird</returns>
+        private async Task FillPipeAsync(SerialPort serialPort, PipeWriter writer, CancellationToken cancellationToken)
+        {
+            const int minimumBufferSize = 750;
+            var keepRunning = true;
+
+            cancellationToken.Register(() => keepRunning = false);
+
+            while (keepRunning)
             {
-                var newLine = serialPort.ReadLine();
-                
-                this.logger.LogTrace(newLine);
+                // Allocate at least 750 bytes from the PipeWriter.
+                Memory<byte> memory = writer.GetMemory(minimumBufferSize);
+
+                try
+                {
+                    int bytesRead = await serialPort.BaseStream.ReadAsync(memory, cancellationToken);
+                    if (bytesRead == 0)
+                    {
+                        break;
+                    }
+                    // Tell the PipeWriter how much was read from the Socket.
+                    writer.Advance(bytesRead);
+                }
+                catch (Exception exception)
+                {
+                    this.logger.LogError(exception, "An exception accoured while writing to the pipline from serialport {0}", serialPort.PortName);
+                    break;
+                }
+
+                // Make the data available to the PipeReader.
+                FlushResult result = await writer.FlushAsync();
+
+                if (result.IsCompleted)
+                {
+                    break;
+                }
             }
+
+            // By completing PipeWriter, tell the PipeReader that there's no more data coming.
+            await writer.CompleteAsync();
+        }
+        #endregion
+
+        #region ReadPipeAsync
+        /// <summary>
+        /// Liest die Pipe aus, parsed die Daten und gibt diese weiter an die API. (Wird erst beenden, wenn cancellationToken abgebrochen wird)
+        /// </summary>
+        /// <param name="reader">Der Reader von der Pipe, welche ausgelesen werden soll</param>
+        /// <param name="cancellationToken"></param>
+        /// <returns>Wird erst beenden, wenn cancellationToken abgebrochen wird</returns>
+        private async Task ReadPipeAsync(PipeReader reader, CancellationToken cancellationToken)
+        {
+            var keepRunning = true;
+            cancellationToken.Register(() => keepRunning = false);
+
+            while (keepRunning)
+            {
+                ReadResult result = await reader.ReadAsync();
+                ReadOnlySequence<byte> buffer = result.Buffer;
+
+                while (this.TryReadMessage(ref buffer, out ReadOnlySequence<byte> line, "\n"))
+                {
+                    // Process the line.
+                    //this.ProcessLine(line);
+                }
+
+                // Tell the PipeReader how much of the buffer has been consumed.
+                reader.AdvanceTo(buffer.Start, buffer.End);
+
+                // Stop reading if there's no more data coming.
+                if (result.IsCompleted)
+                {
+                    break;
+                }
+            }
+
+            // Mark the PipeReader as complete.
+            await reader.CompleteAsync();
+        }
+        #endregion
+
+        #region TryReadMessage
+        /// <summary>
+        /// Versucht die Message im Buffer zu lesen. Dafür wird nach dem Ende der Message gesucht. 
+        /// </summary>
+        /// <param name="buffer">Der Puffer, welcher durchsucht werden soll</param>
+        /// <param name="messageEnd">Der String nach dem gesucht werden soll</param>
+        /// <param name="messageLine">Die Message welche aus dem Puffer ermittelt wurde</param>
+        /// <returns>Gibt zurück, ob das Message end enthalten ist</returns>
+        private bool TryReadMessage (ref ReadOnlySequence<byte> buffer, out ReadOnlySequence<byte> messageLine, string messageEnd)
+        {
+            var result = false;
+            // Look for a EOL in the buffer.
+            SequencePosition? position = buffer.PositionOf((byte)'\n');
+            
+            if (buffer.Length > 7)
+            {
+                var bufferEndSlice = buffer.Slice(buffer.Length - 7 + 1, 7);
+                
+                if (bufferEndSlice.ToString() == ";22;1;%;")
+                {
+                    result = true;
+                }
+            }
+
+            messageLine = new ReadOnlySequence<byte>();
+
+            return result;
         }
         #endregion
     }
